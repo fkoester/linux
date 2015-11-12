@@ -52,6 +52,7 @@
 #include <linux/uaccess.h>
 #include <linux/miscdevice.h>
 #include <linux/toshiba.h>
+#include <linux/rfkill.h>
 #include <acpi/video.h>
 
 MODULE_AUTHOR("John Belmonte");
@@ -119,6 +120,7 @@ MODULE_LICENSE("GPL");
 #define HCI_ECO_MODE			0x0097
 #define HCI_ACCELEROMETER2		0x00a6
 #define HCI_SYSTEM_INFO			0xc000
+#define HCI_WIRELESS				0x0056
 #define SCI_PANEL_POWER_ON		0x010d
 #define SCI_ILLUMINATION		0x014e
 #define SCI_USB_SLEEP_CHARGE		0x0150
@@ -159,6 +161,12 @@ MODULE_LICENSE("GPL");
 #define SCI_USB_CHARGE_BAT_LVL		0x0200
 #define SCI_USB_CHARGE_RAPID_DSP	0x0300
 
+// WWAN support
+#define WWAN_KILLSWITCH_MASK			0x01
+#define WWAN_PRESENT							0x0f
+#define WWAN_PLUGGED_MASK					0x4000
+#define WWAN_POWER_MASK						0x2000
+
 struct toshiba_acpi_dev {
 	struct acpi_device *acpi_dev;
 	const char *method_hci;
@@ -197,12 +205,22 @@ struct toshiba_acpi_dev {
 	unsigned int kbd_function_keys_supported:1;
 	unsigned int panel_power_on_supported:1;
 	unsigned int usb_three_supported:1;
+	unsigned int wwan_supported:1;
 	unsigned int sysfs_created:1;
 	unsigned int special_functions;
 
 	bool kbd_led_registered;
 	bool illumination_led_registered;
 	bool eco_led_registered;
+};
+
+struct toshiba_wwan_dev {
+	struct toshiba_acpi_dev *toshiba_acpi_dev;
+	struct rfkill *rfk;
+
+	bool killswitch;
+	bool plugged;
+	bool powered;
 };
 
 static struct toshiba_acpi_dev *toshiba_acpi;
@@ -338,6 +356,15 @@ static acpi_status tci_raw(struct toshiba_acpi_dev *dev,
 static u32 hci_write(struct toshiba_acpi_dev *dev, u32 reg, u32 in1)
 {
 	u32 in[TCI_WORDS] = { HCI_SET, reg, in1, 0, 0, 0 };
+	u32 out[TCI_WORDS];
+	acpi_status status = tci_raw(dev, in, out);
+
+	return ACPI_SUCCESS(status) ? out[0] : TOS_FAILURE;
+}
+
+static u32 hci_write2(struct toshiba_acpi_dev *dev, u32 reg, u32 in1, u32 in2)
+{
+	u32 in[TCI_WORDS] = { HCI_SET, reg, in1, in2, 0, 0 };
 	u32 out[TCI_WORDS];
 	acpi_status status = tci_raw(dev, in, out);
 
@@ -2525,6 +2552,183 @@ static int toshiba_acpi_setup_backlight(struct toshiba_acpi_dev *dev)
 	return 0;
 }
 
+static int toshiba_wwan_present(struct toshiba_acpi_dev *dev)
+{
+	acpi_status result;
+	u32 wwan_present;
+	u32 value;
+
+	result = hci_read(dev, HCI_WIRELESS, &value);
+	if (ACPI_FAILURE(result)) {
+		pr_err("ACPI call to query WWAN presence failed");
+		return -ENXIO;
+	}
+
+	wwan_present = (value & WWAN_PRESENT) ? true : false;
+
+	if (!wwan_present) {
+		pr_info("WWAN device not present\n");
+		return -ENODEV;
+	}
+
+	return 0;
+}
+
+static int toshiba_wwan_status(struct toshiba_acpi_dev *dev)
+{
+	acpi_status result;
+	u32 status;
+
+	result = hci_read(dev, HCI_WIRELESS, &status);
+	if (ACPI_FAILURE(result)) {
+		pr_err("Could not get WWAN device status\n");
+		return -ENXIO;
+	}
+
+	return status;
+}
+
+static int toshiba_wwan_enable(struct toshiba_acpi_dev *dev)
+{
+	acpi_status result;
+
+	result = hci_write2(dev, HCI_WIRELESS, 1, WWAN_PLUGGED_MASK);
+	if (ACPI_FAILURE(result)) {
+		pr_err("Could not attach WWAN device\n");
+		return -ENXIO;
+	}
+
+	result = hci_write2(dev, HCI_WIRELESS, 1, WWAN_POWER_MASK);
+	if (ACPI_FAILURE(result)) {
+		pr_err("Could not power ON wwan device\n");
+		return -ENXIO;
+	}
+
+	return 0;
+}
+
+static int toshiba_wwan_disable(struct toshiba_acpi_dev *dev)
+{
+	acpi_status result;
+
+	result = hci_write2(dev, HCI_WIRELESS, 0, WWAN_POWER_MASK);
+	if (ACPI_FAILURE(result)) {
+		pr_err("Could not power OFF WWAN device\n");
+		return -ENXIO;
+	}
+
+	result = hci_write2(dev, HCI_WIRELESS, 0, WWAN_PLUGGED_MASK);
+	if (ACPI_FAILURE(result)) {
+		pr_err("Could not detach WWAN device\n");
+		return -ENXIO;
+	}
+
+	return 0;
+}
+
+/* Helper function */
+static int toshiba_wwan_sync_status(struct toshiba_wwan_dev *wwan_dev)
+{
+	int status;
+
+	status = toshiba_wwan_status(wwan_dev->toshiba_acpi_dev);
+	if (status < 0) {
+		pr_err("Could not sync wwan device status\n");
+		return status;
+	}
+
+	wwan_dev->killswitch = (status & WWAN_KILLSWITCH_MASK) ? true : false;
+	wwan_dev->plugged = (status & WWAN_PLUGGED_MASK) ? true : false;
+	wwan_dev->powered = (status & WWAN_POWER_MASK) ? true : false;
+
+	pr_debug("WWAN status %d killswitch %d plugged %d powered %d\n",
+		 status, wwan_dev->killswitch, wwan_dev->plugged, wwan_dev->powered);
+
+	return 0;
+}
+
+/* RFKill handlers */
+static int wwan_rfkill_set_block(void *data, bool blocked)
+{
+	struct toshiba_wwan_dev *wwan_dev = data;
+	int ret;
+
+	ret = toshiba_wwan_sync_status(wwan_dev);
+	if (ret)
+		return ret;
+
+	if (!wwan_dev->killswitch)
+		return 0;
+
+	if (blocked)
+		ret = toshiba_wwan_disable(wwan_dev->toshiba_acpi_dev);
+	else
+		ret = toshiba_wwan_enable(wwan_dev->toshiba_acpi_dev);
+
+	return ret;
+}
+
+static void wwan_rfkill_poll(struct rfkill *rfkill, void *data)
+{
+	struct toshiba_wwan_dev *wwan_dev = data;
+
+	if (toshiba_wwan_sync_status(wwan_dev))
+		return;
+
+	rfkill_set_hw_state(wwan_dev->rfk, !wwan_dev->killswitch);
+}
+
+static const struct rfkill_ops wwan_rfk_ops = {
+	.set_block = wwan_rfkill_set_block,
+	.poll = wwan_rfkill_poll,
+};
+
+
+static int toshiba_acpi_setup_wwan_rfkill(struct toshiba_acpi_dev *dev)
+{
+	struct toshiba_wwan_dev *wwan_dev;
+	int result;
+
+	result = toshiba_wwan_present(dev);
+	if (result)
+		return result;
+
+	pr_info("Toshiba ACPI WWAN rfkill device driver\n");
+
+	wwan_dev = kzalloc(sizeof(*wwan_dev), GFP_KERNEL);
+	if (!wwan_dev)
+		return -ENOMEM;
+	wwan_dev->toshiba_acpi_dev = dev;
+
+	result = toshiba_wwan_sync_status(wwan_dev);
+	if (result) {
+		kfree(wwan_dev);
+		return result;
+	}
+
+	wwan_dev->rfk = rfkill_alloc("Toshiba WWAN",
+				   &dev->acpi_dev->dev,
+				   RFKILL_TYPE_WWAN,
+				   &wwan_rfk_ops,
+				   wwan_dev);
+	if (!wwan_dev->rfk) {
+		pr_err("Unable to allocate wwan rfkill device\n");
+		kfree(wwan_dev);
+		return -ENOMEM;
+	}
+
+	rfkill_set_hw_state(wwan_dev->rfk, !wwan_dev->killswitch);
+
+	result = rfkill_register(wwan_dev->rfk);
+	if (result) {
+		pr_err("Unable to register wwan rfkill device\n");
+		rfkill_destroy(wwan_dev->rfk);
+		kfree(wwan_dev);
+	}
+
+	return result;
+}
+
 static void print_supported_features(struct toshiba_acpi_dev *dev)
 {
 	pr_info("Supported laptop features:");
@@ -2561,6 +2765,8 @@ static void print_supported_features(struct toshiba_acpi_dev *dev)
 		pr_cont(" panel-power-on");
 	if (dev->usb_three_supported)
 		pr_cont(" usb3");
+	if (dev->wwan_supported)
+		pr_cont(" wwan");
 
 	pr_cont("\n");
 }
@@ -2735,6 +2941,9 @@ static int toshiba_acpi_add(struct acpi_device *acpi_dev)
 
 	ret = get_fan_status(dev, &dummy);
 	dev->fan_supported = !ret;
+
+	ret = toshiba_acpi_setup_wwan_rfkill(dev);
+	dev->wwan_supported = !ret;
 
 	print_supported_features(dev);
 
